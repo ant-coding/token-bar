@@ -2,6 +2,10 @@
 
 TokenBar is a small native macOS menu bar app for local Codex and Claude Code token usage. It reads local JSONL usage history, summarizes tokens by period and tool, and shows API-equivalent cost estimates as a reference.
 
+## Preview
+
+<img src="Assets/tokenbar-popover.png" alt="TokenBar weekly usage popover showing token totals, chart, and tool breakdown" width="420">
+
 It is not a billing source of truth.
 
 ## Features
