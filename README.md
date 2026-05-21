@@ -51,6 +51,10 @@ The script builds a release binary, assembles and ad-hoc signs:
 
 It also creates a root `TokenBar.app` convenience copy for local Finder launches. Generated `.app` bundles are ignored by Git.
 
+## Releases
+
+Release builds are published as zipped app bundles on GitHub Releases. The repeatable release checklist is in [RELEASE.md](RELEASE.md).
+
 ## Terminal Usage
 
 Print today's summary:
