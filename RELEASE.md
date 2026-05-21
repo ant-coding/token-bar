@@ -29,8 +29,8 @@ The app is currently ad-hoc signed by `Scripts/build-app.sh`. That verifies bund
 ```bash
 rm -rf dist
 mkdir -p dist
-ditto -c -k --keepParent TokenBar.app dist/TokenBar-0.0.1-macos-arm64.zip
-shasum -a 256 dist/TokenBar-0.0.1-macos-arm64.zip > dist/TokenBar-0.0.1-macos-arm64.zip.sha256
+COPYFILE_DISABLE=1 ditto -c -k --norsrc --keepParent TokenBar.app dist/TokenBar-0.0.1-macos-arm64.zip
+(cd dist && shasum -a 256 TokenBar-0.0.1-macos-arm64.zip > TokenBar-0.0.1-macos-arm64.zip.sha256)
 ```
 
 Use `macos-arm64` because the default SwiftPM release build on Apple Silicon produces an ARM64 binary. Build a universal binary before changing the artifact name.
