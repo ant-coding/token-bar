@@ -15,7 +15,11 @@ TokenBar is a small native macOS menu bar app for local Codex and Claude Code to
   </tr>
 </table>
 
-It is not a billing source of truth.
+## Cost Estimate Disclaimer
+
+TokenBar shows an approximation of equivalent API costs based on local token usage and the pricing data currently built into the app. Provider prices and token accounting rules can change, so the app's pricing table needs to be updated when those prices change.
+
+This is not a billing dashboard or a source of truth for invoices. It is meant to give you a practical sense of how many tokens you are spending locally, what that usage might look like under API-style pricing, and how your local usage pattern compares with direct API request costs.
 
 ## Features
 
