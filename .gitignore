@@ -1,0 +1,31 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode and local Apple build products
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+*.xcresult
+*.dSYM/
+
+# Generated macOS app bundles
+*.app/
+
+# macOS Finder metadata
+.DS_Store
+
+# Local editor / assistant state
+.claude/settings.local.json
+
+# Local secrets and machine-specific config
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.mobileprovision
+*.provisionprofile
+*.xcconfig.local
