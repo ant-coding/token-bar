@@ -831,15 +831,41 @@ enum ThemePreference: String, Codable, CaseIterable, Sendable {
     }
 
     @MainActor
-    func apply() {
+    private var appearance: NSAppearance? {
         switch self {
         case .system:
-            NSApp.appearance = nil
+            return nil
         case .light:
-            NSApp.appearance = NSAppearance(named: .aqua)
+            return NSAppearance(named: .aqua)
         case .dark:
-            NSApp.appearance = NSAppearance(named: .darkAqua)
+            return NSAppearance(named: .darkAqua)
         }
+    }
+
+    @MainActor
+    func apply(popover: NSPopover? = nil) {
+        let appearance = appearance
+        NSApp.appearance = appearance
+        popover?.appearance = appearance
+        popover?.contentViewController?.view.appearance = appearance
+
+        for window in NSApp.windows {
+            window.appearance = appearance
+            window.contentViewController?.view.appearance = appearance
+            if let contentView = window.contentView {
+                invalidateAppearanceTree(contentView)
+            }
+            window.displayIfNeeded()
+        }
+    }
+}
+
+@MainActor
+private func invalidateAppearanceTree(_ view: NSView) {
+    view.needsDisplay = true
+    view.layer?.setNeedsDisplay()
+    for subview in view.subviews {
+        invalidateAppearanceTree(subview)
     }
 }
 
@@ -2211,6 +2237,32 @@ private enum Easing {
     nonisolated(unsafe) static let outExpo  = CAMediaTimingFunction(controlPoints: 0.16, 1.0, 0.30, 1.0)
 }
 
+// Run `block` inside a CATransaction that suppresses implicit animations. Used by views
+// that drive layer colors / frames from `refreshColors`-style helpers where we want
+// immediate updates rather than the default 0.25s fade.
+private func withoutLayerAnimations(_ block: () -> Void) {
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    block()
+    CATransaction.commit()
+}
+
+// Shared hover-tracking installer for the settings buttons (GhostButton, EmberAccentButton,
+// SecondaryButton). Each tears down its old tracking area and re-installs a full-bounds one
+// listening for enter/exit only.
+@MainActor
+private func installHoverTracking(on view: NSView, previous: inout NSTrackingArea?) {
+    if let previous { view.removeTrackingArea(previous) }
+    let area = NSTrackingArea(
+        rect: view.bounds,
+        options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+        owner: view,
+        userInfo: nil
+    )
+    view.addTrackingArea(area)
+    previous = area
+}
+
 // MARK: - Bucket chart (N capsules, stacked by originator)
 //
 // Reused across periods: 24 buckets (hours) for `.day`, 7 for `.week`, 30 for `.month`.
@@ -3102,6 +3154,48 @@ private func containsJSONLFile(in root: URL) -> Bool {
     return false
 }
 
+// Tiny dot used to signal status next to a short label. Three tones:
+// neutral (idle), warning (amber), error (red). Sits left of the status text in a
+// provider row.
+@MainActor
+private final class StatusPip: NSView {
+    enum Tone { case neutral, warning, error }
+
+    var tone: Tone = .neutral { didSet { needsDisplay = true } }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 6).isActive = true
+        heightAnchor.constraint(equalToConstant: 6).isActive = true
+        layer?.cornerRadius = 3
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        super.updateLayer()
+        effectiveAppearance.performAsCurrentDrawingAppearance { [weak self] in
+            guard let self else { return }
+            let color: NSColor
+            switch self.tone {
+            case .neutral: color = NSColor.tertiaryLabelColor
+            case .warning: color = NSColor.systemOrange
+            case .error:   color = NSColor.systemRed
+            }
+            self.layer?.backgroundColor = color.cgColor
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
 @MainActor
 private final class ProviderPathRowView: NSView {
     var onChange: (() -> Void)?
@@ -3110,17 +3204,32 @@ private final class ProviderPathRowView: NSView {
     private var enabled: Bool
     private var paths: [String]
 
-    private let enabledButton = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+    private let toggle: EmberToggle
     private let titleLabel = NSTextField(labelWithString: "")
     private let pathLabel = NSTextField(labelWithString: "")
+    private let statusDot = StatusPip()
     private let statusLabel = NSTextField(labelWithString: "")
-    private let chooseButton = NSButton(title: "Choose Folder...", target: nil, action: nil)
-    private let resetButton = NSButton(title: "Reset", target: nil, action: nil)
+    private let statusRow = NSStackView()
+    private let chooseButton: IconActionButton
+    private let resetButton: IconActionButton
 
     init(provider: ConfigurableProvider, enabled: Bool, paths: [String]) {
         self.provider = provider
         self.enabled = enabled
         self.paths = paths.isEmpty ? provider.defaultPaths : paths
+        self.toggle = EmberToggle(isOn: enabled)
+        self.chooseButton = IconActionButton(
+            symbolName: "folder",
+            label: "Change folder",
+            target: nil,
+            action: nil
+        )
+        self.resetButton = IconActionButton(
+            symbolName: "arrow.counterclockwise",
+            label: "Reset to default",
+            target: nil,
+            action: nil
+        )
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         buildView()
@@ -3135,16 +3244,10 @@ private final class ProviderPathRowView: NSView {
     var firstBlockingError: String? { validationStatus().blockingMessage }
 
     private func buildView() {
-        wantsLayer = true
-        layer?.cornerRadius = 7
-        layer?.borderWidth = 1
-        refreshBorderColor()
-
         let outer = NSStackView()
         outer.orientation = .vertical
         outer.alignment = .leading
         outer.spacing = 8
-        outer.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
         outer.translatesAutoresizingMaskIntoConstraints = false
         addSubview(outer)
 
@@ -3158,30 +3261,27 @@ private final class ProviderPathRowView: NSView {
         let header = NSStackView()
         header.orientation = .horizontal
         header.alignment = .centerY
-        header.spacing = 8
-        header.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        header.spacing = 10
+        header.widthAnchor.constraint(equalToConstant: SettingsStyle.contentWidth).isActive = true
 
-        enabledButton.target = self
-        enabledButton.action = #selector(enabledChanged)
-        enabledButton.setContentHuggingPriority(.required, for: .horizontal)
+        toggle.onToggle = { [weak self] _ in self?.enabledChanged() }
 
         titleLabel.attributedStringValue = NSAttributedString(string: provider.displayName, attributes: [
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
             .foregroundColor: NSColor.labelColor
         ])
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         chooseButton.target = self
         chooseButton.action = #selector(chooseFolder)
-        chooseButton.bezelStyle = .rounded
 
         resetButton.target = self
         resetButton.action = #selector(resetPath)
-        resetButton.bezelStyle = .rounded
 
-        header.addArrangedSubview(enabledButton)
+        header.addArrangedSubview(toggle)
         header.addArrangedSubview(titleLabel)
         header.addArrangedSubview(spacer)
         header.addArrangedSubview(chooseButton)
@@ -3190,24 +3290,30 @@ private final class ProviderPathRowView: NSView {
 
         pathLabel.lineBreakMode = .byTruncatingMiddle
         pathLabel.maximumNumberOfLines = 3
-        pathLabel.widthAnchor.constraint(equalToConstant: 420).isActive = true
-        outer.addArrangedSubview(pathLabel)
+        pathLabel.widthAnchor.constraint(equalToConstant: SettingsStyle.contentWidth - 44).isActive = true
+        let pathRow = NSStackView()
+        pathRow.orientation = .horizontal
+        pathRow.alignment = .firstBaseline
+        pathRow.spacing = 0
+        let pathIndent = NSView()
+        pathIndent.translatesAutoresizingMaskIntoConstraints = false
+        pathIndent.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        pathRow.addArrangedSubview(pathIndent)
+        pathRow.addArrangedSubview(pathLabel)
+        outer.addArrangedSubview(pathRow)
 
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.spacing = 6
+        let statusIndent = NSView()
+        statusIndent.translatesAutoresizingMaskIntoConstraints = false
+        statusIndent.widthAnchor.constraint(equalToConstant: 44).isActive = true
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.maximumNumberOfLines = 1
-        statusLabel.widthAnchor.constraint(equalToConstant: 420).isActive = true
-        outer.addArrangedSubview(statusLabel)
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        refreshBorderColor()
-    }
-
-    private func refreshBorderColor() {
-        effectiveAppearance.performAsCurrentDrawingAppearance { [weak self] in
-            self?.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
-        }
+        statusRow.addArrangedSubview(statusIndent)
+        statusRow.addArrangedSubview(statusDot)
+        statusRow.addArrangedSubview(statusLabel)
+        outer.addArrangedSubview(statusRow)
     }
 
     private func validationStatus() -> ProviderPathStatus {
@@ -3240,38 +3346,43 @@ private final class ProviderPathRowView: NSView {
     }
 
     private func refresh() {
-        enabledButton.state = enabled ? .on : .off
+        toggle.setOn(enabled, animated: false)
         chooseButton.isEnabled = enabled
+        resetButton.isEnabled = enabled
 
         let pathText = configuredPaths
             .map(displayProviderPath)
             .joined(separator: "\n")
         pathLabel.attributedStringValue = NSAttributedString(string: pathText, attributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
+            .font: NSFont.monospacedSystemFont(ofSize: 10.5, weight: .regular),
             .foregroundColor: enabled ? NSColor.secondaryLabelColor : NSColor.tertiaryLabelColor
         ])
 
+        titleLabel.textColor = enabled ? .labelColor : .tertiaryLabelColor
+
         let status = validationStatus()
         if let error = status.blockingMessage {
-            statusLabel.isHidden = false
+            statusRow.isHidden = false
+            statusDot.tone = .error
             statusLabel.attributedStringValue = NSAttributedString(string: error, attributes: [
-                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
                 .foregroundColor: NSColor.systemRed
             ])
         } else if let warning = status.warningMessage {
-            statusLabel.isHidden = false
+            statusRow.isHidden = false
+            statusDot.tone = .warning
             statusLabel.attributedStringValue = NSAttributedString(string: warning, attributes: [
-                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
                 .foregroundColor: NSColor.systemOrange
             ])
         } else {
-            statusLabel.isHidden = true
+            statusRow.isHidden = true
             statusLabel.stringValue = ""
         }
     }
 
     @objc private func enabledChanged() {
-        enabled = enabledButton.state == .on
+        enabled = toggle.isOn
         refresh()
         onChange?()
     }
@@ -3310,13 +3421,521 @@ private final class SettingsBackgroundView: NSView {
     override func updateLayer() {
         super.updateLayer()
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            layer?.backgroundColor = NSColor.codexPopoverBackground.cgColor
         }
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
+    }
+}
+
+// MARK: - Settings primitives
+//
+// Small helpers that re-use the popover's design language inside the settings panel:
+// kerned-caps section headers, hairline dividers, an ember-tinted toggle, an
+// ember-underline segmented selector, and ghost / accent buttons. The settings
+// window is built on these so it reads as an extension of the popover, not a System
+// Settings dialog grafted on.
+
+@MainActor
+private enum SettingsStyle {
+    static let contentWidth: CGFloat = 436
+    static let contentInsetX: CGFloat = 24
+    // Includes room for the transparent titlebar so the eyebrow clears the traffic lights.
+    static let topInset: CGFloat = 44
+    static let bottomInset: CGFloat = 22
+
+    static func sectionLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: "")
+        label.attributedStringValue = NSAttributedString(string: text.uppercased(), attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+            .foregroundColor: NSColor.tertiaryLabelColor,
+            .kern: 1.8
+        ])
+        return label
+    }
+}
+
+@MainActor
+private final class HairlineView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 1).isActive = true
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func updateLayer() {
+        super.updateLayer()
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+// Ember-tinted segmented control with the same underline indicator as PeriodSelectorView.
+// Used for the theme picker so the settings panel speaks the same control vocabulary as
+// the popover's DAY / WEEK / MONTH selector.
+@MainActor
+final class EmberSegmentedControl: NSView {
+    var onSelect: ((Int) -> Void)?
+    private(set) var selectedIndex: Int
+
+    private let titles: [String]
+    private let buttons: [NSButton]
+    private let indicator = CALayer()
+
+    init(titles: [String], selectedIndex: Int) {
+        self.titles = titles
+        self.selectedIndex = selectedIndex
+        self.buttons = titles.map { _ in
+            let b = NSButton()
+            b.bezelStyle = .inline
+            b.isBordered = false
+            b.setButtonType(.momentaryChange)
+            return b
+        }
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        for (i, b) in buttons.enumerated() {
+            b.tag = i
+            b.target = self
+            b.action = #selector(buttonClicked(_:))
+            addSubview(b)
+        }
+        indicator.actions = [
+            "bounds": NSNull(),
+            "position": NSNull(),
+            "backgroundColor": NSNull(),
+            "cornerRadius": NSNull()
+        ]
+        indicator.cornerRadius = 1
+        layer?.addSublayer(indicator)
+        applyTitles()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 24) }
+
+    func setSelected(_ index: Int, animated: Bool) {
+        guard index != selectedIndex, titles.indices.contains(index) else { return }
+        selectedIndex = index
+        applyTitles()
+        layoutIndicator(animated: animated)
+    }
+
+    private func applyTitles() {
+        for (i, b) in buttons.enumerated() {
+            let active = (i == selectedIndex)
+            b.attributedTitle = NSAttributedString(
+                string: titles[i].uppercased(),
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 10, weight: active ? .bold : .semibold),
+                    .foregroundColor: active ? NSColor.labelColor : NSColor.tertiaryLabelColor,
+                    .kern: 1.8
+                ]
+            )
+            b.sizeToFit()
+        }
+        needsLayout = true
+    }
+
+    @objc private func buttonClicked(_ sender: NSButton) {
+        guard titles.indices.contains(sender.tag), sender.tag != selectedIndex else { return }
+        setSelected(sender.tag, animated: true)
+        onSelect?(sender.tag)
+    }
+
+    override func layout() {
+        super.layout()
+        guard bounds.width > 0 else { return }
+        let segW = bounds.width / CGFloat(titles.count)
+        for (i, b) in buttons.enumerated() {
+            b.sizeToFit()
+            let x = CGFloat(i) * segW + (segW - b.frame.width) / 2
+            let y = (bounds.height - b.frame.height) / 2 + 2
+            b.frame.origin = CGPoint(x: x, y: y)
+        }
+        layoutIndicator(animated: false)
+    }
+
+    private func layoutIndicator(animated: Bool) {
+        guard bounds.width > 0 else { return }
+        let segW = bounds.width / CGFloat(titles.count)
+        let indicatorWidth: CGFloat = 18
+        let x = CGFloat(selectedIndex) * segW + (segW - indicatorWidth) / 2
+        let frame = CGRect(x: x, y: 0, width: indicatorWidth, height: 2)
+        if animated {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.34)
+            CATransaction.setAnimationTimingFunction(Easing.outExpo)
+            indicator.frame = frame
+            CATransaction.commit()
+        } else {
+            indicator.frame = frame
+        }
+        refreshIndicatorColor()
+    }
+
+    private func refreshIndicatorColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance { [indicator] in
+            indicator.backgroundColor = NSColor.codexEmber.cgColor
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshIndicatorColor()
+    }
+}
+
+// Compact pill toggle tinted in ember instead of the system accent. Reads as a refined
+// macOS switch but belongs visually to the popover's warm palette.
+@MainActor
+final class EmberToggle: NSControl {
+    var onToggle: ((Bool) -> Void)?
+    private(set) var isOn: Bool
+
+    private let trackLayer = CALayer()
+    private let knobLayer = CALayer()
+
+    init(isOn: Bool) {
+        self.isOn = isOn
+        super.init(frame: NSRect(x: 0, y: 0, width: 34, height: 20))
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 34).isActive = true
+        heightAnchor.constraint(equalToConstant: 20).isActive = true
+        wantsLayer = true
+
+        trackLayer.cornerRadius = 10
+        trackLayer.frame = bounds
+        knobLayer.cornerRadius = 8
+        knobLayer.shadowOpacity = 0.18
+        knobLayer.shadowRadius = 1.5
+        knobLayer.shadowOffset = CGSize(width: 0, height: -0.5)
+        knobLayer.shadowColor = NSColor.black.cgColor
+
+        layer?.addSublayer(trackLayer)
+        layer?.addSublayer(knobLayer)
+        refreshLayers(animated: false)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func setOn(_ value: Bool, animated: Bool) {
+        guard value != isOn else { return }
+        isOn = value
+        refreshLayers(animated: animated)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        isOn.toggle()
+        refreshLayers(animated: true)
+        onToggle?(isOn)
+    }
+
+    override func layout() {
+        super.layout()
+        trackLayer.frame = bounds
+        refreshLayers(animated: false)
+    }
+
+    private func refreshLayers(animated: Bool) {
+        let knobInset: CGFloat = 2
+        let knobSize = bounds.height - knobInset * 2
+        let onX = bounds.width - knobInset - knobSize
+        let offX = knobInset
+        let frame = CGRect(
+            x: isOn ? onX : offX,
+            y: knobInset,
+            width: knobSize,
+            height: knobSize
+        )
+
+        effectiveAppearance.performAsCurrentDrawingAppearance { [trackLayer, knobLayer, isOn] in
+            let trackColor: NSColor = isOn
+                ? .codexEmber
+                : NSColor.separatorColor.withAlphaComponent(0.6)
+            let knobColor: NSColor = .white
+
+            CATransaction.begin()
+            if animated {
+                CATransaction.setAnimationDuration(0.22)
+                CATransaction.setAnimationTimingFunction(Easing.outQuart)
+            } else {
+                CATransaction.setDisableActions(true)
+            }
+            trackLayer.backgroundColor = trackColor.cgColor
+            knobLayer.frame = frame
+            knobLayer.backgroundColor = knobColor.cgColor
+            CATransaction.commit()
+        }
+    }
+
+    override var isEnabled: Bool {
+        didSet { alphaValue = isEnabled ? 1.0 : 0.5 }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshLayers(animated: false)
+    }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .checkBox }
+    override func accessibilityValue() -> Any? { isOn ? 1 : 0 }
+}
+
+// Square icon button used for row-level actions (change folder, reset). Matches the
+// popover's tertiary-icon vocabulary (gear, refresh, chevrons) but with a softer
+// ember-ghost hover background so the action surface reads clearly inside the
+// settings panel where the chrome is more spacious than the popover header.
+@MainActor
+final class IconActionButton: NSButton {
+    private let bg = CALayer()
+    private var trackingArea: NSTrackingArea?
+    private var hovered: Bool = false { didSet { refresh() } }
+
+    convenience init(symbolName: String, label: String, target: AnyObject?, action: Selector?) {
+        self.init(frame: .zero)
+        wantsLayer = true
+        bg.cornerRadius = 6
+        layer?.insertSublayer(bg, at: 0)
+
+        image = NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
+        imagePosition = .imageOnly
+        isBordered = false
+        bezelStyle = .inline
+        setButtonType(.momentaryChange)
+        symbolConfiguration = .init(pointSize: 12, weight: .medium)
+        contentTintColor = .secondaryLabelColor
+        toolTip = label
+        setAccessibilityLabel(label)
+        self.target = target
+        self.action = action
+
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 26).isActive = true
+        heightAnchor.constraint(equalToConstant: 26).isActive = true
+        refresh()
+    }
+
+    override func layout() {
+        super.layout()
+        bg.frame = bounds
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        installHoverTracking(on: self, previous: &trackingArea)
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = isEnabled }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+
+    override var isEnabled: Bool {
+        didSet {
+            if !isEnabled { hovered = false }
+            refresh()
+        }
+    }
+
+    private func refresh() {
+        let tint: NSColor
+        if !isEnabled {
+            tint = .quaternaryLabelColor
+        } else if hovered {
+            tint = .codexEmber
+        } else {
+            tint = .secondaryLabelColor
+        }
+        contentTintColor = tint
+
+        effectiveAppearance.performAsCurrentDrawingAppearance { [bg, hovered, isEnabled] in
+            let fill: NSColor = (hovered && isEnabled) ? .codexEmberGhost : .clear
+            withoutLayerAnimations {
+                bg.backgroundColor = fill.cgColor
+            }
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refresh()
+    }
+}
+
+// Filled ember "primary" button used for Save.
+@MainActor
+final class EmberAccentButton: NSButton {
+    private let bg = CALayer()
+    private var hovered: Bool = false { didSet { refreshColors() } }
+    private var pressed: Bool = false { didSet { refreshColors() } }
+    private var trackingArea: NSTrackingArea?
+
+    convenience init(title: String, target: AnyObject?, action: Selector?) {
+        self.init(frame: .zero)
+        self.target = target
+        self.action = action
+        wantsLayer = true
+        isBordered = false
+        bezelStyle = .inline
+        setButtonType(.momentaryChange)
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 28).isActive = true
+
+        bg.cornerRadius = 6
+        layer?.insertSublayer(bg, at: 0)
+
+        self.title = title
+        applyTitle(title)
+    }
+
+    override var title: String {
+        didSet { applyTitle(title) }
+    }
+
+    private func applyTitle(_ text: String) {
+        attributedTitle = NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.white,
+            .kern: 0.2
+        ])
+    }
+
+    override func layout() {
+        super.layout()
+        bg.frame = bounds
+        refreshColors()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        installHoverTracking(on: self, previous: &trackingArea)
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false; pressed = false }
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        pressed = true
+        super.mouseDown(with: event)
+        pressed = false
+    }
+
+    override var isEnabled: Bool { didSet { refreshColors() } }
+
+    private func refreshColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance { [weak self] in
+            guard let self else { return }
+            let base = NSColor.codexEmber
+            let color: NSColor
+            if !isEnabled {
+                color = NSColor.codexEmberDim.withAlphaComponent(0.5)
+            } else if pressed {
+                color = base.blended(withFraction: 0.18, of: .black) ?? base
+            } else if hovered {
+                color = base.blended(withFraction: 0.08, of: .white) ?? base
+            } else {
+                color = base
+            }
+            withoutLayerAnimations { bg.backgroundColor = color.cgColor }
+        }
+        alphaValue = isEnabled ? 1.0 : 0.6
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshColors()
+    }
+}
+
+// Subtle outlined "secondary" button used for Cancel — same height as EmberAccentButton
+// so they sit on a shared baseline.
+@MainActor
+final class SecondaryButton: NSButton {
+    private let bg = CALayer()
+    private let border = CALayer()
+    private var hovered: Bool = false { didSet { refreshColors() } }
+    private var trackingArea: NSTrackingArea?
+
+    convenience init(title: String, target: AnyObject?, action: Selector?) {
+        self.init(frame: .zero)
+        self.target = target
+        self.action = action
+        wantsLayer = true
+        isBordered = false
+        bezelStyle = .inline
+        setButtonType(.momentaryChange)
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 28).isActive = true
+
+        bg.cornerRadius = 6
+        border.cornerRadius = 6
+        border.borderWidth = 1
+        border.backgroundColor = NSColor.clear.cgColor
+        layer?.insertSublayer(bg, at: 0)
+        layer?.addSublayer(border)
+
+        self.title = title
+        applyTitle(title)
+    }
+
+    override var title: String {
+        didSet { applyTitle(title) }
+    }
+
+    private func applyTitle(_ text: String) {
+        attributedTitle = NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .kern: 0.2
+        ])
+    }
+
+    override func layout() {
+        super.layout()
+        bg.frame = bounds
+        border.frame = bounds
+        refreshColors()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        installHoverTracking(on: self, previous: &trackingArea)
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+
+    private func refreshColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance { [weak self] in
+            guard let self else { return }
+            withoutLayerAnimations {
+                bg.backgroundColor = (hovered
+                    ? NSColor.separatorColor.withAlphaComponent(0.18)
+                    : NSColor.clear).cgColor
+                border.borderColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
+            }
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshColors()
     }
 }
 
@@ -3328,15 +3947,12 @@ private final class ProviderSettingsViewController: NSViewController {
 
     private let codexRow: ProviderPathRowView
     private let claudeRow: ProviderPathRowView
-    private let themeControl = NSSegmentedControl(
-        labels: ThemePreference.allCases.map(\.title),
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
-    private let saveButton = NSButton(title: "Save", target: nil, action: nil)
-    private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+    private let themeControl: EmberSegmentedControl
+    private let saveButton: EmberAccentButton
+    private let cancelButton: SecondaryButton
     private let statusLabel = NSTextField(labelWithString: "")
+    private let statusDot = StatusPip()
+    private let statusRow = NSStackView()
     private var themePreference: ThemePreference
 
     init(config: AppConfig) {
@@ -3352,42 +3968,67 @@ private final class ProviderSettingsViewController: NSViewController {
             enabled: normalized.providerPaths.claudeCodeEnabled,
             paths: normalized.providerPaths.claudeCodeRoots
         )
+        self.themeControl = EmberSegmentedControl(
+            titles: ThemePreference.allCases.map(\.title),
+            selectedIndex: ThemePreference.allCases.firstIndex(of: normalized.themePreference) ?? 0
+        )
+        self.saveButton = EmberAccentButton(title: "Save", target: nil, action: nil)
+        self.cancelButton = SecondaryButton(title: "Cancel", target: nil, action: nil)
         super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) { nil }
 
     override func loadView() {
-        let container = SettingsBackgroundView(frame: NSRect(x: 0, y: 0, width: 480, height: 370))
+        let panelWidth: CGFloat = SettingsStyle.contentWidth + SettingsStyle.contentInsetX * 2
+        let container = SettingsBackgroundView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 480))
         container.wantsLayer = true
         view = container
 
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .leading
-        root.spacing = 12
+        root.spacing = 0
         root.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(root)
 
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 22),
-            root.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -22),
-            root.topAnchor.constraint(equalTo: container.topAnchor, constant: 20),
-            root.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -18)
+            root.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: SettingsStyle.contentInsetX),
+            root.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -SettingsStyle.contentInsetX),
+            root.topAnchor.constraint(equalTo: container.topAnchor, constant: SettingsStyle.topInset),
+            container.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: SettingsStyle.bottomInset)
         ])
+
+        // Header: kerned eyebrow ("TOKENBAR") + ultralight title ("Settings"). Mirrors the
+        // popover's hero stack — small label, big restrained word, generous gap.
+        let eyebrow = NSTextField(labelWithString: "")
+        eyebrow.attributedStringValue = NSAttributedString(string: "TOKENBAR", attributes: [
+            .font: NSFont.systemFont(ofSize: 9.5, weight: .bold),
+            .foregroundColor: NSColor.codexEmber,
+            .kern: 2.4
+        ])
+        root.addArrangedSubview(eyebrow)
+        root.setCustomSpacing(6, after: eyebrow)
 
         let title = NSTextField(labelWithString: "")
         title.attributedStringValue = NSAttributedString(string: "Settings", attributes: [
-            .font: NSFont.systemFont(ofSize: 17, weight: .semibold),
-            .foregroundColor: NSColor.labelColor
+            .font: NSFont.systemFont(ofSize: 22, weight: .ultraLight),
+            .foregroundColor: NSColor.labelColor,
+            .kern: -0.4
         ])
         root.addArrangedSubview(title)
+        root.setCustomSpacing(22, after: title)
+
+        // APPEARANCE
+        let appearanceLabel = SettingsStyle.sectionLabel("Appearance")
+        root.addArrangedSubview(appearanceLabel)
+        root.setCustomSpacing(10, after: appearanceLabel)
 
         let themeRow = NSStackView()
         themeRow.orientation = .horizontal
         themeRow.alignment = .centerY
         themeRow.spacing = 12
-        themeRow.widthAnchor.constraint(equalToConstant: 436).isActive = true
+        themeRow.widthAnchor.constraint(equalToConstant: SettingsStyle.contentWidth).isActive = true
 
         let themeLabel = NSTextField(labelWithString: "")
         themeLabel.attributedStringValue = NSAttributedString(string: "Theme", attributes: [
@@ -3399,47 +4040,75 @@ private final class ProviderSettingsViewController: NSViewController {
         let themeSpacer = NSView()
         themeSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        themeControl.segmentStyle = .rounded
-        themeControl.target = self
-        themeControl.action = #selector(themeChanged)
-        themeControl.selectedSegment = ThemePreference.allCases.firstIndex(of: themePreference) ?? 0
-        themeControl.translatesAutoresizingMaskIntoConstraints = false
-        themeControl.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        themeControl.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        themeControl.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        themeControl.onSelect = { [weak self] index in self?.themeSelected(index) }
 
         themeRow.addArrangedSubview(themeLabel)
         themeRow.addArrangedSubview(themeSpacer)
         themeRow.addArrangedSubview(themeControl)
         root.addArrangedSubview(themeRow)
+        root.setCustomSpacing(22, after: themeRow)
+
+        let divider1 = HairlineView()
+        divider1.widthAnchor.constraint(equalToConstant: SettingsStyle.contentWidth).isActive = true
+        root.addArrangedSubview(divider1)
+        root.setCustomSpacing(20, after: divider1)
+
+        // PROVIDERS
+        let providersLabel = SettingsStyle.sectionLabel("Providers")
+        root.addArrangedSubview(providersLabel)
+        root.setCustomSpacing(14, after: providersLabel)
 
         codexRow.onChange = { [weak self] in self?.refreshSaveState() }
         claudeRow.onChange = { [weak self] in self?.refreshSaveState() }
         root.addArrangedSubview(codexRow)
-        root.addArrangedSubview(claudeRow)
+        root.setCustomSpacing(14, after: codexRow)
 
-        statusLabel.lineBreakMode = .byTruncatingTail
+        let rowDivider = HairlineView()
+        rowDivider.widthAnchor.constraint(equalToConstant: SettingsStyle.contentWidth).isActive = true
+        root.addArrangedSubview(rowDivider)
+        root.setCustomSpacing(14, after: rowDivider)
+
+        root.addArrangedSubview(claudeRow)
+        root.setCustomSpacing(22, after: claudeRow)
+
+        let divider2 = HairlineView()
+        divider2.widthAnchor.constraint(equalToConstant: SettingsStyle.contentWidth).isActive = true
+        root.addArrangedSubview(divider2)
+        root.setCustomSpacing(14, after: divider2)
+
+        // Status + footer.
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.spacing = 6
+        statusRow.widthAnchor.constraint(equalToConstant: SettingsStyle.contentWidth).isActive = true
+        statusLabel.lineBreakMode = .byTruncatingMiddle
         statusLabel.maximumNumberOfLines = 1
-        statusLabel.widthAnchor.constraint(equalToConstant: 436).isActive = true
-        root.addArrangedSubview(statusLabel)
+        statusRow.addArrangedSubview(statusDot)
+        statusRow.addArrangedSubview(statusLabel)
+        root.addArrangedSubview(statusRow)
+        root.setCustomSpacing(18, after: statusRow)
 
         let footer = NSStackView()
         footer.orientation = .horizontal
         footer.alignment = .centerY
-        footer.spacing = 8
-        footer.widthAnchor.constraint(equalToConstant: 436).isActive = true
+        footer.spacing = 10
+        footer.widthAnchor.constraint(equalToConstant: SettingsStyle.contentWidth).isActive = true
 
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let footerSpacer = NSView()
+        footerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         cancelButton.target = self
         cancelButton.action = #selector(cancelClicked)
-        cancelButton.bezelStyle = .rounded
+        cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 84).isActive = true
 
         saveButton.target = self
         saveButton.action = #selector(saveClicked)
-        saveButton.bezelStyle = .rounded
         saveButton.keyEquivalent = "\r"
+        saveButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
 
-        footer.addArrangedSubview(spacer)
+        footer.addArrangedSubview(footerSpacer)
         footer.addArrangedSubview(cancelButton)
         footer.addArrangedSubview(saveButton)
         root.addArrangedSubview(footer)
@@ -3464,17 +4133,17 @@ private final class ProviderSettingsViewController: NSViewController {
         saveButton.isEnabled = firstError == nil
 
         if let firstError {
-            statusLabel.isHidden = false
+            statusDot.tone = .error
             statusLabel.attributedStringValue = NSAttributedString(string: firstError, attributes: [
-                .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
                 .foregroundColor: NSColor.systemRed
             ])
         } else {
-            statusLabel.isHidden = false
+            statusDot.tone = .neutral
             statusLabel.attributedStringValue = NSAttributedString(
-                string: "Config: \(displayProviderPath(AppConfigManager.configURL.path))",
+                string: "Config · \(displayProviderPath(AppConfigManager.configURL.path))",
                 attributes: [
-                    .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+                    .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
                     .foregroundColor: NSColor.tertiaryLabelColor
                 ]
             )
@@ -3482,9 +4151,9 @@ private final class ProviderSettingsViewController: NSViewController {
     }
 
     func showError(_ message: String) {
-        statusLabel.isHidden = false
+        statusDot.tone = .error
         statusLabel.attributedStringValue = NSAttributedString(string: message, attributes: [
-            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
             .foregroundColor: NSColor.systemRed
         ])
     }
@@ -3497,9 +4166,9 @@ private final class ProviderSettingsViewController: NSViewController {
         onSave?(currentConfig)
     }
 
-    @objc private func themeChanged() {
-        guard (0..<ThemePreference.allCases.count).contains(themeControl.selectedSegment) else { return }
-        themePreference = ThemePreference.allCases[themeControl.selectedSegment]
+    private func themeSelected(_ index: Int) {
+        guard ThemePreference.allCases.indices.contains(index) else { return }
+        themePreference = ThemePreference.allCases[index]
         onThemeChange?(themePreference)
     }
 
@@ -3516,12 +4185,17 @@ private final class ProviderSettingsWindowController: NSWindowController, NSWind
     init(config: AppConfig) {
         settingsViewController = ProviderSettingsViewController(config: config)
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 370),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 484, height: 520),
+            styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        panel.title = "Settings"
+        // Empty title + transparent titlebar so the panel's own warm content runs
+        // edge-to-edge behind the traffic lights, matching the popover's chrome-free feel.
+        panel.title = ""
+        panel.titlebarAppearsTransparent = true
+        panel.titleVisibility = .hidden
+        panel.isMovableByWindowBackground = true
         panel.contentViewController = settingsViewController
         panel.isReleasedWhenClosed = false
         panel.level = .floating
@@ -4400,9 +5074,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var refreshTask: Task<Void, Never>?
     private var pendingRebuildAfterRefresh = false
     private var currentSelection = selectionFromArguments()
+    private var activeThemePreference: ThemePreference = .system
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        AppConfigManager.load().themePreference.apply()
+        let launchConfig = AppConfigManager.load()
+        activeThemePreference = launchConfig.themePreference
         NSApp.setActivationPolicy(.accessory)
 
         if let button = statusItem.button {
@@ -4413,10 +5089,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.toolTip = "Codex token usage"
         }
 
+        // The status item button must follow the *system* menu bar appearance, not the
+        // app's chosen theme. Picking "Dark" in our Settings sets NSApp.appearance to
+        // darkAqua globally, which would otherwise force the template icon white even on
+        // a light menu bar (where it would be invisible against the white background).
+        pinStatusItemAppearance()
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(systemAppearanceChanged),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil
+        )
+
         popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
         popover.contentViewController = usageViewController
+        activeThemePreference.apply(popover: popover)
+        pinStatusItemAppearance()
 
         usageViewController.setPeriod(currentSelection.period, animated: false)
         usageViewController.onRefresh = { [weak self] in
@@ -4522,25 +5212,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
-        let controller = ProviderSettingsWindowController(config: AppConfigManager.load())
+        let initialConfig = AppConfigManager.load()
+        let controller = ProviderSettingsWindowController(config: initialConfig)
         controller.onClose = { [weak self, weak controller] in
             guard let self, let controller else { return }
             if self.settingsWindowController === controller {
                 self.settingsWindowController = nil
             }
         }
-        controller.settingsViewController.onCancel = { [weak controller] in
+        controller.settingsViewController.onCancel = { [weak self, weak controller] in
+            let savedTheme = AppConfigManager.load().themePreference
             controller?.close()
-        }
-        controller.settingsViewController.onThemeChange = { [weak controller] theme in
-            do {
-                var config = AppConfigManager.load()
-                config.themePreference = theme
-                try AppConfigManager.save(config)
-                theme.apply()
-            } catch {
-                controller?.settingsViewController.showError("Theme save failed: \(error.localizedDescription)")
+            DispatchQueue.main.async {
+                self?.applyTheme(savedTheme)
             }
+        }
+        controller.settingsViewController.onThemeChange = { [weak self] theme in
+            self?.applyTheme(theme)
         }
         controller.settingsViewController.onSave = { [weak self, weak controller] config in
             guard let self else { return }
@@ -4548,8 +5236,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 let existingProviderPaths = AppConfigManager.load().providerPaths.normalized()
                 let shouldRebuild = existingProviderPaths != config.providerPaths.normalized()
                 try AppConfigManager.save(config)
-                config.themePreference.apply()
+                let savedTheme = config.themePreference
+                let needsThemeApply = self.activeThemePreference != savedTheme
                 controller?.close()
+                if needsThemeApply {
+                    DispatchQueue.main.async {
+                        self.applyTheme(savedTheme)
+                    }
+                }
                 if shouldRebuild {
                     self.refreshAll(showSpinner: true, rebuild: true)
                 }
@@ -4566,12 +5260,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private func applyTheme(_ theme: ThemePreference) {
+        activeThemePreference = theme
+        theme.apply(popover: popover)
+        pinStatusItemAppearance()
+    }
+
+    private static func systemMenuBarAppearance() -> NSAppearance? {
+        // macOS exposes the global dark-mode preference via this user default; the key is
+        // absent in light mode and "Dark" in dark mode. We read it directly so we get the
+        // real system value rather than whatever NSApp.appearance has been overridden to.
+        let isDark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        return NSAppearance(named: isDark ? .darkAqua : .aqua)
+    }
+
+    private func pinStatusItemAppearance() {
+        statusItem.button?.appearance = Self.systemMenuBarAppearance()
+    }
+
+    @objc private func systemAppearanceChanged() {
+        // System dark-mode toggled outside of our app — re-pin so the template icon
+        // re-tints against the new menu bar background.
+        DispatchQueue.main.async { [weak self] in
+            self?.pinStatusItemAppearance()
+        }
+    }
+
     @objc private func togglePopover(_ sender: Any?) {
         guard let button = statusItem.button else { return }
 
         if popover.isShown {
             popover.performClose(sender)
             return
+        }
+
+        let savedTheme = AppConfigManager.load().themePreference
+        if savedTheme != activeThemePreference {
+            applyTheme(savedTheme)
+        } else {
+            savedTheme.apply(popover: popover)
         }
 
         // Show whatever's cached for the current period instantly; if the cache is empty

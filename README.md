@@ -4,7 +4,16 @@ TokenBar is a small native macOS menu bar app for local Codex and Claude Code to
 
 ## Preview
 
-<img src="Assets/tokenbar-popover.png" alt="TokenBar weekly usage popover showing token totals, chart, and tool breakdown" width="420">
+<table>
+  <tr>
+    <th>Light</th>
+    <th>Dark</th>
+  </tr>
+  <tr>
+    <td><img src="Assets/tokenbar-popover.png" alt="TokenBar light weekly usage popover showing token totals, chart, and tool breakdown" width="360"></td>
+    <td><img src="Assets/tokenbar-popover-dark.png" alt="TokenBar dark weekly usage popover showing token totals, chart, and tool breakdown" width="360"></td>
+  </tr>
+</table>
 
 It is not a billing source of truth.
 
