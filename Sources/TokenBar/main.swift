@@ -4628,6 +4628,31 @@ final class UsageViewController: NSViewController {
         periodSelector.setPeriod(period, animated: animated)
     }
 
+    private func updatePreferredContentSize() {
+        view.needsLayout = true
+        view.layoutSubtreeIfNeeded()
+        let contentHeight = ceil(root.fittingSize.height) + topPadding + bottomPadding
+        let newSize = NSSize(width: 340, height: contentHeight)
+        guard preferredContentSize != newSize else { return }
+
+        let window = view.window
+        let oldFrame = window?.frame
+
+        // A visible NSPopover re-anchors its private window when preferredContentSize
+        // changes. Keep the shell fixed so period filters only swap content.
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            preferredContentSize = newSize
+
+            guard let window, let oldFrame, window.isVisible else { return }
+            var frame = window.frame
+            frame.origin.x = oldFrame.origin.x
+            frame.origin.y = oldFrame.maxY - frame.height
+            window.setFrame(frame, display: true, animate: false)
+        }
+    }
+
     func setLoading(_ loading: Bool) {
         if loading {
             refreshButton.isHidden = true
@@ -4727,14 +4752,7 @@ final class UsageViewController: NSViewController {
         )
         footerLabel.toolTip = "\(snapshot.tokenEvents) token events across \(snapshot.scannedFiles) recent session files"
 
-        // Drive popover sizing from actual content height
-        view.needsLayout = true
-        view.layoutSubtreeIfNeeded()
-        let contentHeight = ceil(root.fittingSize.height) + topPadding + bottomPadding
-        let newSize = NSSize(width: 340, height: contentHeight)
-        if preferredContentSize != newSize {
-            preferredContentSize = newSize
-        }
+        updatePreferredContentSize()
     }
 
     /// Dateline reflects the active window. Day = full date; week = "Week of Mon May 4";
